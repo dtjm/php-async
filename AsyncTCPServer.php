@@ -1,67 +1,115 @@
-<?php namespace Async;
+<?php namespace Async\TCP;
 
-class TCPServer {
-    public $connectCallback;
+function eventReadCallback($bufferEvent, $connection) {
+    $cb = $connection->dataCallback;
+    if(!$cb)
+        return;
+
+    $dataArray = array();
+    while($data = event_buffer_read($bufferEvent, 256)) {
+        $dataArray[] = $data;
+    }
+
+    $cb(implode(NULL, $dataArray));
+};
+
+function eventWriteCallback($bufferEvent, $connection) {
+    $connection->writePending = FALSE;
+
+    if($connection->closePending) {
+        $connection->close();
+    }
+};
+
+function eventErrorCallback($bufferEvent, $events, $connection) {
+    $connection->close();
+
+    $cb = $connection->disconnectCallback;
+    if($cb) {
+        $cb();
+    }
+};
+
+
+class Connection {
+    public $socket;
+    public $eventBuffer;
+    public $tcpServer;
     public $dataCallback;
-    public $closeCallback;
-    public $listenSocket;
+    public $disconnectCallback;
+    public $writePending = FALSE;
+    public $closePending = FALSE;
+
+    function __construct($socket, $server) {
+        $this->socket = $socket;
+        $this->tcpServer = $server;
+
+        stream_set_blocking($socket, 0);
+
+        $this->eventBuffer = event_buffer_new(
+            $socket,          // File descriptor to watch
+            '\Async\TCP\eventReadCallback',             // Read event callback
+            '\Async\TCP\eventWriteCallback',             // Write event callback
+            '\Async\TCP\eventErrorCallback', // Error callback
+            $this // Custom data to provide to callback
+        );
+
+        event_buffer_base_set($this->eventBuffer, $server->eventBase);
+        // event_buffer_timeout_set($this->eventBuffer, 30, 30);
+        event_buffer_watermark_set($this->eventBuffer, EV_READ | EV_WRITE, 0, 0xffffff);
+        event_buffer_priority_set($this->eventBuffer, 10);
+        event_buffer_enable($this->eventBuffer, EV_READ | EV_WRITE | EV_PERSIST);
+    }
+
+    function write($bytes) {
+        $this->writePending = TRUE;
+        event_buffer_write($this->eventBuffer, $bytes);
+    }
+
+    function close() {
+        if(!$this->writePending)
+            $this->_close();
+        else {
+            echo "WAITING FOR WRITE\n";
+            $this->closePending = TRUE;
+        }
+    }
+
+    function _close() {
+        event_buffer_disable($this->eventBuffer, EV_READ | EV_WRITE);
+        event_buffer_free($this->eventBuffer);
+        fclose($this->socket);
+        unset($this->eventBuffer, $this->socket);
+        echo "TCP CONNECTION CLOSED\n";
+    }
+
+    function onData($function) {
+        $this->dataCallback = $function;
+    }
+
+    function onDisconnect($function) {
+        $this->disconnectCallback = $function;
+    }
+}
+
+class Server {
+    public $connectCallback;
+    public $socket;
     public $address;
     public $eventBase;
-    public $connections;
-    public $buffers;
-    public $count;
     public $evAccept;
-    public $evRead;
-    public $evError;
 
     function __construct($address) {
         $this->address = $address;
-        $this->connections = array();
-        $this->buffers = array();
-        $this->count = 0;
+        $this->eventBase = \event_base_new();
 
         $this->evAccept = function($fd, $events, $server) {
-            $conn = stream_socket_accept($fd);
-            stream_set_blocking($conn, 0);
+            $socket = stream_socket_accept($fd);
+            $connection = new Connection($socket, $server);
 
-            $buffer = event_buffer_new(
-                $conn, $server->evRead, NULL, $server->evError, array($server, $server->count));
-            event_buffer_base_set($buffer, $server->eventBase);
-            event_buffer_timeout_set($buffer, 30, 30);
-            event_buffer_watermark_set($buffer, EV_READ, 0, 0xffffff);
-            event_buffer_priority_set($buffer, 10);
-            event_buffer_enable($buffer, EV_READ | EV_PERSIST);
-
-            $server->connections[$server->count] = $conn;
-            $server->buffers[$server->count] = $buffer;
-
-            $server->count += 1;
             $cb = $server->connectCallback;
             if($cb) {
-                $cb();
-            }
-        };
-
-        $this->evRead = function($buffer, $data) {
-            $server = $data[0];
-            $cb = $server->dataCallback;
-            while($read = event_buffer_read($buffer, 256)) {
-                if($cb) {
-                    $cb($read);
-                }
-            }
-        };
-
-        $this->evError = function($buffer, $error, $data) {
-            $server = $data[0];
-            $id = $data[1];
-            event_buffer_disable($server->buffers[$id], EV_READ | EV_WRITE);
-            event_buffer_free($server->buffers[$id]);
-            fclose($server->connections[$id]);
-            unset($server->buffers[$id], $server->connections[$id]);
-            $cb = $server->closeCallback;
-            if($cb) {
-                $cb();
+                $cb($connection);
             }
         };
     }
@@ -70,23 +118,14 @@ class TCPServer {
         $this->connectCallback = $function;
     }
 
-    function onData($function) {
-        $this->dataCallback = $function;
-    }
-
-    function onClose($function) {
-        $this->closeCallback = $function;
-    }
-
     function run() {
-        $this->listenSocket = stream_socket_server($this->address);
+        $this->socket = stream_socket_server($this->address);
 
-        $this->eventBase = event_base_new();
         $event = event_new();
 
         event_set(
             $event, // The libevent Event object
-            $this->listenSocket, // The file descriptor to watch
+            $this->socket, // The file descriptor to watch
             EV_READ|EV_PERSIST, // Watch for READ events and watch the event forever, not just once
             $this->evAccept, // Call this function when the event happens
             $this); // Pass this as the 3rd argument to the callback
